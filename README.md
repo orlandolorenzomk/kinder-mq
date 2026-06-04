@@ -143,17 +143,6 @@ Opens at `http://localhost:8080/architecture.html` — includes system architect
 
 ---
 
-## C Implementation
-
-A C23 port is included in `c/`. Same protocol, same architecture, no external dependencies.
-
-```bash
-make -C c
-./c/bin/kindermq --config=config.yml
-```
-
----
-
 ## Project Structure
 
 ```
