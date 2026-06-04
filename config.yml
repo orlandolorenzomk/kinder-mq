@@ -1,0 +1,5 @@
+name: kinder-instance-01
+port: 8091
+maxClients: 5000
+maxTopics: 250
+maxPayloadBytes: 2048

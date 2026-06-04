@@ -1,0 +1,304 @@
+= KinderMQ — Architecture
+:toc: left
+:toc-title: Contents
+:toclevels: 3
+:sectnums:
+:icons: font
+:source-highlighter: highlight.js
+:highlightjs-theme: github
+:imagesdir: images
+:imagesoutdir: build/images
+:diagram-cachedir: build/.cache
+:doctype: article
+
+== Overview
+
+KinderMQ is a lightweight, in-process TCP message broker written in Java 21.
+It implements a pure publish/subscribe model: producers write messages to named topics,
+and all active subscribers on that topic receive each message in real time.
+
+[cols="1,3", options="header"]
+|===
+| Property | Value
+| Transport | TCP (plain text, line-delimited)
+| Protocol | Text — semicolon-separated commands
+| Delivery | Push (fan-out to all subscribers per topic)
+| Storage | None — messages are not persisted
+| Runtime | Java 21, virtual threads
+| Config | YAML (`config.yml`)
+|===
+
+== Wire Protocol
+
+Every message exchanged with the broker is a single UTF-8 line terminated by `\n`.
+Fields are separated by `;`.
+
+=== Command Reference
+
+[cols="2,4,4", options="header"]
+|===
+| Command | Syntax | Description
+| `SUBSCRIBE`   | `SUBSCRIBE;<name>;<topic1,topic2,...>` | Register a subscriber and start receiving messages
+| `UNSUBSCRIBE` | `UNSUBSCRIBE;<name>;<topic1,topic2,...>` | Remove subscriber registration
+| `WRITE`       | `WRITE;<topic>;<payload>` | Publish a message to a topic
+| `READ`        | `READ;<name>;<topic>` | _Not supported in pub/sub mode_
+|===
+
+=== Example Session
+
+[source,text]
+----
+# Terminal 1 — subscriber
+SUBSCRIBE;alice;news,sports
+
+# Terminal 2 — publisher
+WRITE;news;{"headline":"KinderMQ is fast"}
+
+# Terminal 1 receives
+{"headline":"KinderMQ is fast"}
+----
+
+== System Architecture
+
+[plantuml, system-architecture, svg]
+....
+@startuml
+skinparam backgroundColor #FAFAFA
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 13
+skinparam ArrowColor #555555
+skinparam componentBorderColor #888888
+skinparam componentBackgroundColor #FFFFFF
+skinparam packageBorderColor #CCCCCC
+skinparam packageBackgroundColor #F5F5F5
+
+title KinderMQ — System Overview
+
+actor "Producer" as P1
+actor "Subscriber" as S1
+actor "Subscriber" as S2
+
+package "KinderMQ Broker" {
+
+  component "BrokerServer\n(TCP Listener)" as BS
+  component "CommandHandler\n(dispatcher)" as CH
+  component "BrokerConnectionManager\n(concurrency limiter)" as BCM
+
+  package "Commands" {
+    component "SubscribeCommand" as SUB
+    component "UnsubscribeCommand" as UNSUB
+    component "WriteCommand" as WR
+    component "ReadCommand" as RD
+  }
+
+  package "Routing State" {
+    database "subscribers\nConcurrentHashMap" as SUBS
+    database "topicIndex\nConcurrentHashMap<topic, List<Subscriber>>" as IDX
+  }
+
+  package "Per-Topic Queues" {
+    queue "topic:0 queue\n(LinkedBlockingQueue)" as Q0
+    queue "topic:N queue\n(LinkedBlockingQueue)" as QN
+  }
+}
+
+P1  --> BS      : TCP connect\nWRITE;topic;payload
+S1  --> BS      : TCP connect\nSUBSCRIBE;name;topics
+S2  --> BS      : TCP connect\nSUBSCRIBE;name;topics
+
+BS  --> BCM     : check connection limit
+BS  --> CH      : dispatch command
+
+CH  --> SUB
+CH  --> UNSUB
+CH  --> WR
+CH  --> RD
+
+SUB  --> SUBS   : register subscriber
+SUB  --> IDX    : index topic → subscriber
+
+WR   --> Q0     : offer(payload)
+WR   --> QN     : offer(payload)
+
+Q0   --> IDX    : drain thread lookups subscribers
+QN   --> IDX    : drain thread lookups subscribers
+
+IDX  --> S1     : write + newLine
+IDX  --> S2     : write + newLine
+
+@enduml
+....
+
+== Component Breakdown
+
+=== BrokerServer
+
+The TCP entry point. Runs an `accept()` loop on a `ServerSocket` and dispatches each
+client connection to a virtual thread via `Executors.newVirtualThreadPerTaskExecutor()`.
+
+Also hosts the background *flusher thread* that calls `flush()` on every active
+subscriber's `BufferedWriter` every 5 ms, decoupling write throughput from syscall cost.
+
+=== BrokerConnectionManager
+
+A thin wrapper around an `AtomicInteger` that enforces `maxClients` from the config.
+Connections that exceed the limit receive an error message and are closed immediately.
+
+=== CommandHandler
+
+Parses the first token of each line as a `CommandType`, delegates to the matching
+`CommandExecutor`, and calls `validateArguments` before `execute`.
+
+=== WriteCommand
+
+The hot path. On each `WRITE`:
+
+1. Looks up (or creates) a `LinkedBlockingQueue` for the target topic via `computeIfAbsent`.
+2. If the queue is new, spawns a single virtual *drain thread* for that topic.
+3. Calls `queue.offer(payload)` — the only per-message cost.
+
+The drain thread blocks on `queue.take()` and fans out to all subscribers in
+`topicIndex.get(topicName)` without any additional task submission.
+
+=== SubscribeCommand
+
+Builds a `SubscriberModel` with a `BufferedWriter` wrapping the client socket's output
+stream and registers it in two structures:
+
+* `subscribers` map (name → model) — for lifecycle management
+* `topicIndex` map (topic → list of models) — for O(1) broadcast routing
+
+=== UnsubscribeCommand
+
+Removes the subscriber from both `subscribers` and every entry in `topicIndex`.
+
+== Message Flow
+
+[plantuml, message-flow, svg]
+....
+@startuml
+skinparam backgroundColor #FAFAFA
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam sequenceArrowColor #555555
+skinparam sequenceBoxBorderColor #888888
+skinparam sequenceLifeLineBorderColor #AAAAAA
+skinparam sequenceParticipantBorderColor #888888
+skinparam sequenceParticipantBackgroundColor #FFFFFF
+
+title Message Flow — WRITE to Fan-out
+
+participant "Producer\n(TCP client)" as P
+participant "BrokerServer\n(virtual thread)" as BS
+participant "WriteCommand" as WC
+participant "BlockingQueue\n[topic]" as Q
+participant "Drain Thread\n[topic]" as DT
+participant "topicIndex\n[topic]" as IDX
+participant "Subscriber A\n(BufferedWriter)" as SA
+participant "Subscriber B\n(BufferedWriter)" as SB
+participant "Flusher Thread\n(every 5ms)" as FT
+
+P  -> BS  : WRITE;sports;{"score":1-0}
+BS -> WC  : execute(["WRITE","sports",...])
+WC -> Q   : offer("{"score":1-0}")
+WC --> BS : return (non-blocking)
+BS --> P  : (ready for next message)
+
+Q  -> DT  : take() unblocks
+DT -> IDX : getOrDefault("sports", [])
+IDX --> DT : [subscriberA, subscriberB]
+
+DT -> SA  : writer.write(payload)\nwriter.newLine()
+DT -> SB  : writer.write(payload)\nwriter.newLine()
+
+... up to 5ms later ...
+
+FT -> SA  : writer.flush()
+FT -> SB  : writer.flush()
+
+SA --> P  : (data on wire to subscriber A)
+SB --> P  : (data on wire to subscriber B)
+
+@enduml
+....
+
+== Connection Lifecycle
+
+[plantuml, connection-lifecycle, svg]
+....
+@startuml
+skinparam backgroundColor #FAFAFA
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+
+title Subscriber Connection Lifecycle
+
+[*] --> Connecting : TCP SYN
+
+Connecting --> Rejected : maxClients reached\nERROR sent, socket closed
+
+Connecting --> Active : SUBSCRIBE;<name>;<topics>\nregistered in subscribers + topicIndex
+
+Active --> Active : receives WRITE fan-out\nvia drain thread
+
+Active --> Unsubscribed : UNSUBSCRIBE;<name>;<topics>\nremoved from subscribers + topicIndex
+
+Active --> Disconnected : socket closed / IO error\nremoved on next broadcast failure
+
+Unsubscribed --> [*]
+Disconnected --> [*]
+Rejected --> [*]
+
+@enduml
+....
+
+== Configuration Reference
+
+The broker reads a YAML file passed via `--config=<path>` at startup.
+
+[source,yaml]
+----
+name: kinder-instance-01   # broker instance name (informational)
+port: 8090                 # TCP port to listen on
+maxClients: 50             # hard cap on simultaneous connections
+maxTopics: 250             # informational limit (not yet enforced)
+maxPayloadBytes: 2048      # informational limit (not yet enforced)
+----
+
+== Running the Broker
+
+[source,bash]
+----
+# Build
+mvn package -q
+
+# Start
+java -jar target/kinder-mq-1.0-SNAPSHOT.jar --config=config.yml
+----
+
+== Performance Notes
+
+Benchmarked on loopback (single machine) with the included `scripts/simulation.go`:
+
+[source,bash]
+----
+go run simulation.go -clients 5 -producers 3 -topics 4 -messages 334000 -drain 10 -duration 120
+----
+
+[cols="2,2", options="header"]
+|===
+| Metric | Observed
+| Messages sent | ~1 000 000
+| Messages delivered (fan-out) | ~3 000 000
+| Throughput (recv/s) | ~280 000 – 315 000
+| Duration | ~10 s
+| Persistence | None
+|===
+
+Key design decisions that drive throughput:
+
+* *Virtual threads* — one per client connection, zero blocking the OS thread pool
+* *Per-topic drain threads* — one `BlockingQueue` + one virtual thread per topic; no per-message task submission
+* *Reverse index* — `topicIndex` gives O(1) subscriber lookup per topic; no full-scan on broadcast
+* *Buffered writes + periodic flush* — `BufferedWriter` + 5 ms flusher decouples writes from syscalls
+* *No persistence* — messages are never stored; fan-out is fire-and-forget
