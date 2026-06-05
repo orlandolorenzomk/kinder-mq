@@ -1,6 +1,6 @@
 # KinderMQ
 
-A lightweight, high-throughput TCP message broker built in Java 21 and C23.
+A lightweight, high-throughput TCP message broker built in Java 21.
 
 Implements a pure **publish/subscribe** model — producers write messages to named topics, all active subscribers receive each message in real time.
 
@@ -22,7 +22,6 @@ IoT scenario (100 producers, 3 consumers, 10 topics):
 | Implementation | Throughput sent/s | Throughput recv/s |
 |---|---|---|
 | Java 21 | ~566,000 | ~566,000 |
-| C23 | ~355,000 | ~497,000 |
 
 ---
 
